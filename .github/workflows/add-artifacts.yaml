@@ -1,0 +1,93 @@
+name: Test add artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  upload-artifact:
+    name: 打包并上传到 GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 安装 ORAS
+        uses: oras-project/setup-oras@v1
+        with:
+          version: '1.3.0'
+
+      - name: 生成示例 tar 包
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p package dist
+          printf '%s\n' '这是用于验证 GHCR 持久化存储的示例制品。' > package/hello.txt
+          printf 'repository=%s\ncommit=%s\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > package/build-info.txt
+          tar -czf dist/demo.tar.gz -C package .
+          (cd dist && sha256sum demo.tar.gz > demo.tar.gz.sha256)
+
+          # GHCR 路径必须小写；每次运行（包括重跑）使用独立 tag。
+          artifact_ref="ghcr.io/${GITHUB_REPOSITORY,,}/test-artifacts:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'ref=%s\n' "$artifact_ref" >> "$GITHUB_OUTPUT"
+
+      - name: 登录 GHCR
+        id: login
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: 上传 tar 包和校验文件
+        working-directory: dist
+        env:
+          ARTIFACT_REF: ${{ steps.package.outputs.ref }}
+        run: |
+          set -euo pipefail
+          oras push "$ARTIFACT_REF" \
+            --image-spec v1.0 \
+            --artifact-type application/vnd.sglang.test-artifact.v1 \
+            --annotation "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation 'org.opencontainers.image.description=用于验证持久化存储的示例 tar 制品' \
+            demo.tar.gz:application/gzip \
+            demo.tar.gz.sha256:text/plain
+
+      - name: 下载并验证上传结果
+        env:
+          ARTIFACT_REF: ${{ steps.package.outputs.ref }}
+        run: |
+          set -euo pipefail
+          oras pull "$ARTIFACT_REF" --output verification
+          (cd verification && sha256sum --check demo.tar.gz.sha256)
+          cmp dist/demo.tar.gz verification/demo.tar.gz
+
+      - name: 输出制品地址和下载命令
+        env:
+          ARTIFACT_REF: ${{ steps.package.outputs.ref }}
+        run: |
+          set -euo pipefail
+          {
+            printf '### GHCR 制品上传成功\n\n'
+            printf '制品地址：`%s`\n\n' "$ARTIFACT_REF"
+            printf '%s\n\n' 'tar 包已重新下载，并通过 SHA-256 校验及原文件比对。'
+            printf '%s\n\n' '首次发布的包默认私有。下载前请安装 ORAS，并使用具有 read:packages 权限的 PAT (classic) 登录；公开包可跳过登录。'
+            printf '%s\n' '```bash'
+            printf 'oras login ghcr.io --username "%s"\n' "$GITHUB_ACTOR"
+            printf 'oras pull "%s"\n' "$ARTIFACT_REF"
+            printf '%s\n' 'sha256sum --check demo.tar.gz.sha256' 'tar -xzf demo.tar.gz' '```'
+            printf '\n%s\n' '制品保存在 GitHub Packages 中，不受 Actions Artifacts 保留期限制；手动删除或额外配置的清理任务仍会移除它。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 退出 GHCR 登录
+        if: ${{ always() && steps.login.outcome == 'success' }}
+        run: oras logout ghcr.io

@@ -1,0 +1,106 @@
+name: Test upload release artifacts
+
+on:
+  workflow_dispatch:
+
+# 使用当前仓库模拟目标仓库，内置 GITHUB_TOKEN 需要 Release 读写权限。
+permissions:
+  contents: write
+
+# 保留显式 --repo 的操作方式，但本次测试只在当前仓库创建 Release。
+# 真正跨仓库时需同时修改目标仓库和 GH_TOKEN，改用具有目标仓库 Contents 读写权限的 RELEASE_TOKEN。
+# 目标仓库的 tag 规则必须允许创建 artifact-demo-*。
+env:
+  TARGET_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  upload-release-artifact:
+    name: 在本仓库模拟跨仓库 Release 上传
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 检查当前仓库凭据
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            printf '%s\n' '::error::未获取到 GITHUB_TOKEN，请检查工作流中的凭据配置。'
+            exit 1
+          fi
+          gh api "repos/${TARGET_REPOSITORY}" --silent
+
+      - name: 生成示例 tar 包和 Release 说明
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p package dist
+          printf '%s\n' '这是在当前仓库模拟跨仓库 Release 上传的示例制品。' > package/hello.txt
+          printf 'repository=%s\ncommit=%s\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > package/build-info.txt
+          tar -czf dist/demo.tar.gz -C package .
+          (cd dist && sha256sum demo.tar.gz > demo.tar.gz.sha256)
+
+          # 区分来源仓库、运行和重跑，避免覆盖已有 Release 或附件。
+          release_tag="artifact-demo-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          {
+            printf '%s\n\n' '在当前仓库模拟跨仓库 Release 制品上传，非正式版本。'
+            printf '来源仓库：%s\n\n' "$GITHUB_REPOSITORY"
+            printf '来源提交：%s\n\n' "$GITHUB_SHA"
+            printf '工作流运行：%s/%s/actions/runs/%s\n\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf '%s\n' '附件为示例 tar 包及 SHA-256 校验文件。Release tag 基于目标仓库默认分支创建。'
+          } > dist/release-notes.txt
+
+      - name: 在目标仓库创建预发布 Release 并上传附件
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 不传来源仓库的 GITHUB_SHA；新 tag 默认指向目标仓库默认分支。
+          # 将附件一并交给 create，CLI 会先上传附件再发布 Release。
+          gh release create "$RELEASE_TAG" \
+            dist/demo.tar.gz dist/demo.tar.gz.sha256 \
+            --repo "$TARGET_REPOSITORY" \
+            --title "本仓库模拟上传 Demo (${RELEASE_TAG})" \
+            --notes-file dist/release-notes.txt \
+            --prerelease \
+            --latest=false
+
+      - name: 下载并验证目标仓库的附件
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" \
+            --repo "$TARGET_REPOSITORY" \
+            --pattern demo.tar.gz \
+            --pattern demo.tar.gz.sha256 \
+            --dir verification
+          (cd verification && sha256sum --check demo.tar.gz.sha256)
+          cmp dist/demo.tar.gz verification/demo.tar.gz
+
+      - name: 输出 Release 链接和下载命令
+        env:
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_url="https://github.com/${TARGET_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          {
+            printf '### 本仓库模拟 Release 上传成功\n\n'
+            printf '[查看 Release](%s)\n\n' "$release_url"
+            printf '%s\n\n' '附件已重新下载，并通过 SHA-256 校验及原文件比对。'
+            printf '%s\n\n' '可在 Release 页面下载附件，或安装 GitHub CLI 后使用以下命令。私有仓库需先通过 gh auth login 登录具有读取权限的账号。'
+            printf '%s\n' '```bash'
+            printf 'gh release download "%s" --repo "%s" --pattern "demo.tar.gz*"\n' \
+              "$RELEASE_TAG" "$TARGET_REPOSITORY"
+            printf '%s\n' 'tar -xzf demo.tar.gz' '```'
+          } >> "$GITHUB_STEP_SUMMARY"
